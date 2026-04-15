@@ -9,7 +9,7 @@
 \usepackage{graphicx}
 \usepackage{amsmath}
 
-\title{Phase-Aware Pooled Rideshare Dispatch on a Real London Map}
+\title{A Real-Map Rideshare Dispatch Benchmark with Strong Heuristic Baselines}
 
 \author{%
   Ahmad Alashoury \\
@@ -26,7 +26,7 @@
 \maketitle
 
 \begin{abstract}
-We study reinforcement learning for pooled rideshare dispatch on a real OpenStreetMap extract of downtown London, Ontario. The problem is intentionally harder than a toy pickup-and-dropoff benchmark: one vehicle with two seats must serve four riders while reasoning about traffic phases, deadlines, and pooling quality. Our main technical contribution is a \emph{phase-aware, hub-level dispatch formulation} that separates high-level stop selection from low-level path following. Instead of learning to drive cell by cell, the agent chooses the next pickup or dropoff stop and the environment executes the shortest path on the real street graph. We combine this abstraction with legal-action masking and curriculum training, then compare Q-learning, SARSA, DQN, and PPO. Over three random seeds, all four methods achieve full task completion, but DQN produces the best service quality: 58.3\% on-time riders, 1.67 late dropoffs on average, and 43.4 steps per episode. The results suggest that compact real-map dispatch environments can be learned by standard RL methods, but neural value approximation is better than tabular methods at exploiting recurring traffic- and rider-pattern structure.
+We study pooled rideshare dispatch on a real OpenStreetMap extract of downtown London, Ontario. The benchmark is intentionally more realistic than a toy pickup-and-dropoff problem: one vehicle with two seats must serve four riders while handling traffic phases, deadlines, and pooling quality. Our contribution is primarily a \emph{benchmark and formulation} rather than a new RL update rule. We introduce a phase-aware, hub-level dispatch MDP that separates high-level stop selection from low-level path following: the agent chooses the next pickup or dropoff stop, and the environment executes the shortest path on the real street graph. We compare Q-learning, SARSA, DQN, and PPO against two simple non-RL baselines, nearest-stop and earliest-deadline-first. Over three random seeds, DQN is the strongest learned policy at 58.3\% on-time riders, 1.67 late dropoffs, and 43.4 steps per episode, but a nearest-stop heuristic is substantially stronger overall at 83.8\% on-time riders and 35.9 steps. A focused DQN ablation also shows that curriculum learning and action masking are not the main source of performance on this benchmark. The main conclusion is therefore not that RL wins, but that the benchmark is useful precisely because it reveals when structured heuristics remain hard to beat.
 \end{abstract}
 
 \section{Introduction}
@@ -34,19 +34,19 @@ Urban rideshare systems must make decisions under uncertainty: which rider shoul
 
 This project studies that decision problem as a reinforcement learning (RL) task. The setting is a single Uber-style vehicle operating on a real downtown London, Ontario street graph derived from OpenStreetMap. The vehicle has two seats and must serve four riders. Each rider has a pickup hub, a dropoff hub, and a delivery-style deadline. The environment also includes traffic phases representing commute, event, and nightlife congestion.
 
-The problem is difficult for existing techniques for three reasons. First, exact dynamic assignment methods can optimize a given batch of trips, but they typically require hand-crafted objectives, known demand, or repeated re-solving and do not naturally learn reusable dispatch policies \citep{alonso2017ride}. Second, tabular RL methods suffer from rapid state growth once multiple riders, deadlines, and traffic contexts are included \citep{watkins1992q, rummery1994line}. Third, end-to-end low-level control wastes learning capacity on movement mechanics when the research question is really about dispatch order.
+The problem is difficult for existing techniques for three reasons. First, exact dynamic assignment methods can optimize a given batch of trips, but they typically require hand-crafted objectives, known demand, or repeated re-solving and do not naturally learn reusable dispatch policies \citep{alonso2017ride}. Second, tabular RL methods suffer from rapid state growth once multiple riders, deadlines, and traffic contexts are included \citep{watkins1992q, rummery1994line}. Third, low-level control methods spend most of their capacity on driving mechanics when the research question is really about dispatch order.
 
-Our intuition is that the rideshare problem becomes both realistic and learnable if we factor it into two layers. The environment should handle shortest-path routing on a real map, while RL should learn the \emph{next stop selection policy}. We implement this idea as a phase-aware, hub-level Markov decision process (MDP) with legal-action masking and curriculum training, then compare Q-learning, SARSA, DQN, and PPO under the same benchmark.
+Our intuition is that the rideshare problem becomes both realistic and learnable if we factor it into two layers. The environment should handle shortest-path routing on a real map, while the decision policy should learn the \emph{next stop selection problem}. We implement this idea as a phase-aware, hub-level Markov decision process (MDP), then compare Q-learning, SARSA, DQN, and PPO against simple handcrafted heuristics. This framing makes the paper stronger: the contribution is a map-grounded benchmark that lets us ask not only which RL method is best, but also whether RL is necessary at all in this compact dispatch setting.
 
 \section{Techniques To Tackle the Problem}
 
 \subsection{Previous Work}
-Classical RL baselines remain useful reference points for dispatch problems. Q-learning learns action values by bootstrapping toward the greedy next action \citep{watkins1992q}, while SARSA performs an on-policy update using the next action actually taken \citep{rummery1994line}. Deep Q-Networks (DQN) replace tabular value storage with a neural approximation and replay buffer, enabling generalization across related states \citep{mnih2015dqn}. PPO provides a stable policy-gradient baseline through clipped policy updates \citep{schulman2017ppo}.
+Classical RL baselines remain useful reference points for dispatch problems. Q-learning learns action values by bootstrapping toward the greedy next action \citep{watkins1992q}, while SARSA performs an on-policy update using the next action actually taken \citep{rummery1994line}. Deep Q-Networks (DQN) replace tabular value storage with a neural approximation and replay buffer, enabling generalization across related states \citep{mnih2015dqn}. PPO provides a stable policy-gradient baseline through clipped policy updates \citep{schulman2017ppo}. In practice, however, rideshare systems are also often approached with simple rule-based dispatch heuristics, so any learned policy should ideally be judged against those baselines too.
 
 Transportation and fleet-management work has shown that realistic dispatching and pooling create large, stochastic decision spaces. Alonso-Mora et al.\ formulate dynamic trip--vehicle assignment for high-capacity ride-sharing and show the value of explicit assignment optimization \citep{alonso2017ride}. Oda and Joe-Wong propose MOVI, a model-free DQN-based fleet management framework, highlighting that learned policies can outperform handcrafted dispatch baselines at scale \citep{oda2018movi}. Lin et al.\ extend this direction with contextual multi-agent deep RL for large-scale fleet management \citep{lin2018fleet}. These papers motivate our project, but they target large-fleet or centralized rebalancing settings rather than a compact, presentation-friendly benchmark where individual dispatch choices remain interpretable.
 
 \subsection{Our Technique}
-The main technique we developed is not a brand-new RL algorithm. Instead, it is a \textbf{new dispatch formulation} that makes a realistic rideshare problem tractable for standard RL baselines. It has four parts.
+The main technique we developed is not a brand-new RL algorithm. Instead, it is a \textbf{dispatch benchmark and formulation} that makes a realistic rideshare problem tractable for standard RL baselines. It has four parts.
 
 \paragraph{(1) Real-map, hub-level abstraction.}
 We start from a real OpenStreetMap extract of downtown London. We rasterize the road network into a \(28 \times 28\) grid, keep the largest connected component, and anchor named hubs such as London Station, Covent Garden Market, Canada Life Place, London City Hall, Victoria Park, Museum London, Grand Theatre, Central Library, Fanshawe Downtown, and Armouries Hotel. The resulting benchmark contains 335 road cells, 10 hubs, and 3 start depots.
@@ -57,8 +57,8 @@ The agent does not choose north, south, east, or west. It chooses one of eight h
 \paragraph{(3) Phase-aware congestion and clustered demand.}
 Each episode activates one traffic phase: \emph{Commute Rush}, \emph{Event Surge}, or \emph{Nightlife Rush}. Phase-specific penalty zones are layered on top of the base hotspot roads. Rider demand is also phase-conditioned through three templates: \emph{Commute Wave}, \emph{Event Exit}, and \emph{Culture Loop}. This creates structured scenarios in which the same dispatch policy should adapt differently under different traffic and rider mixes.
 
-\paragraph{(4) Legal-action masking with curriculum training.}
-Illegal actions are masked: riders cannot be picked up when the car is full, and riders cannot be dropped off before pickup. We also use an easy-to-hard curriculum. Early in training, episodes use two riders, one phase, and larger deadline slack; later episodes use all four riders, all phases, and tighter deadlines. The goal is to teach basic dispatch structure before requiring full-service performance.
+\paragraph{(4) Optional training scaffolding.}
+We also study two common engineering supports: legal-action masking and easy-to-hard curriculum training. Illegal actions can be masked so that riders cannot be picked up when the car is full or dropped off before pickup. Curriculum learning begins with two-rider, low-phase episodes and then increases to the full benchmark. These components were originally intended to stabilize learning; in Section~4 we test whether they actually matter.
 
 \subsection{Benchmark Construction Pipeline}
 The benchmark is generated in four explicit stages. First, we parse a real OpenStreetMap export of downtown London and keep only drivable street segments. Second, we project those coordinates onto a \(28 \times 28\) lattice, rasterize road segments into grid cells, and retain the largest connected component to avoid disconnected fragments. Third, we snap named downtown landmarks to their nearest usable road cells and promote them to hubs or depots. Finally, we overlay benchmark-specific logic: traffic hotspots, phase-dependent congestion regions, clustered rider-demand templates, and deadline heuristics.
@@ -118,32 +118,29 @@ The reward was designed to encode three priorities at once. First, service shoul
 \section{Evaluation}
 
 \subsection{Experimental Setup}
-We compare Q-learning, SARSA, DQN, and PPO. The current final report uses 3 random seeds, 900 training episodes per seed, and 20 greedy evaluation episodes per seed. We report mean reward, full-success rate, on-time rider rate, mean late dropoffs, pooling rate, peak occupancy, and mean evaluation steps.
+We compare Q-learning, SARSA, DQN, and PPO, and we additionally evaluate two hand-crafted baselines: nearest-stop and earliest-deadline-first. The report uses 3 random seeds, 900 training episodes per seed for the learned methods, and 20 greedy evaluation episodes per seed. We report mean reward, full-success rate, on-time rider rate, mean late dropoffs, pooling rate, peak occupancy, and mean evaluation steps.
 
 The algorithm settings are intentionally comparable rather than heavily tuned. Q-learning uses learning rate 0.18 and discount 0.99; SARSA uses 0.14 and 0.985; DQN uses a 128-unit hidden layer, learning rate 0.0011, replay size 16{,}000, batch size 96, and target synchronization every 180 updates; PPO uses a 128-unit policy/value network, policy learning rate 0.001, value learning rate 0.002, 8 rollout episodes per update, and 8 optimization epochs.
 
-We evaluate policies greedily so that the test-time metrics reflect the learned policy rather than exploration noise. The metrics are chosen to separate \emph{completion} from \emph{quality}. Full success rate measures whether all four riders are eventually served. On-time rider rate measures what fraction of served riders beat their deadlines. Late-dropoff count is the complementary penalty-focused metric. Pooling rate records whether the vehicle ever reached occupancy two, peak occupancy summarizes how aggressively the learned policy pooled riders, and step count measures route efficiency. This metric set matters because a benchmark in which all algorithms achieve 100\% completion can still reveal large practical quality differences.
-
-\subsection{Baselines and Comparison Logic}
-The four compared methods play different roles in the study. Q-learning is the classical off-policy tabular baseline; if it performs well, then the benchmark may still be simple enough for memorization. SARSA is the on-policy tabular counterpart and tests whether slightly more conservative value updates help in deadline-sensitive settings. DQN is the neural value-based baseline and is expected to benefit if the benchmark contains reusable structure across rider configurations and traffic phases. PPO is the policy-gradient baseline and is useful because it optimizes a stochastic policy directly rather than only learning action values.
-
-This comparison setup lets us interpret outcomes rather than just rank methods. If tabular methods dominate, then our abstraction may still be too small. If PPO dominates, then policy learning may matter more than value approximation. If DQN dominates, then the likely story is that function approximation plus replay helps exploit repeated dispatch motifs. As shown below, the last pattern is what emerged in our experiments.
+We evaluate policies greedily so that the test-time metrics reflect the learned policy rather than exploration noise. The metrics are chosen to separate \emph{completion} from \emph{quality}. Full success rate measures whether all four riders are eventually served. On-time rider rate measures what fraction of served riders beat their deadlines. Late-dropoff count is the complementary penalty-focused metric. Pooling rate records whether the vehicle ever reached occupancy two, peak occupancy summarizes how aggressively the learned policy pooled riders, and step count measures route efficiency. This metric set matters because a benchmark in which all algorithms achieve 100\% completion can still reveal large practical quality differences. The role of the hand-crafted baselines is equally important: if a simple geometric rule already solves the benchmark extremely well, then the correct conclusion is not ``RL wins,'' but rather that the environment still favors local dispatch heuristics.
 
 \subsection{Quantitative Results}
-Table~\ref{tab:main-results} summarizes the main results. All four algorithms reach 100\% task completion on this benchmark, so completion itself is not the meaningful separator. The interesting differences appear in service quality.
+Table~\ref{tab:main-results} summarizes the main results. All six methods reach 100\% task completion on this benchmark, so completion itself is not the meaningful separator. The interesting differences appear in service quality.
 
 \begin{table}[t]
     \centering
-    \caption{Three-seed evaluation results on the London dispatch benchmark. Higher on-time rate is better; lower late dropoffs and steps are better.}
+    \caption{Three-seed evaluation results on the London dispatch benchmark. All methods achieved 100\% completion, so we report service-quality metrics. Values are mean $\pm$ standard deviation across seeds for on-time riders.}
     \label{tab:main-results}
     \begin{tabular}{lcccc}
         \toprule
-        Method & On-time (\%) & Late dropoffs & Pooling (\%) & Steps \\
+        Method & Type & On-time (\%) & Late dropoffs & Steps \\
         \midrule
-        Q-learning & 53.3 & 1.87 & 100.0 & 45.55 \\
-        SARSA & 52.1 & 1.92 & 100.0 & 45.78 \\
-        DQN & \textbf{58.3} & \textbf{1.67} & 98.3 & \textbf{43.43} \\
-        PPO & 56.7 & 1.73 & 93.3 & 45.43 \\
+        Q-learning & RL & 53.3 $\pm$ 1.2 & 1.87 & 45.55 \\
+        SARSA & RL & 52.1 $\pm$ 2.1 & 1.92 & 45.78 \\
+        DQN & RL & 58.3 $\pm$ 5.1 & 1.67 & 43.43 \\
+        PPO & RL & 56.7 $\pm$ 1.6 & 1.73 & 45.43 \\
+        Nearest-stop & heuristic & \textbf{83.8 $\pm$ 6.7} & \textbf{0.65} & \textbf{35.95} \\
+        Earliest-deadline & heuristic & 67.9 $\pm$ 1.6 & 1.28 & 49.35 \\
         \bottomrule
     \end{tabular}
 \end{table}
@@ -156,26 +153,31 @@ Table~\ref{tab:main-results} summarizes the main results. All four algorithms re
 \end{figure}
 
 \subsection{Analysis}
-The central empirical result is that DQN performs best overall. It achieves the highest on-time rider rate, the fewest late dropoffs, and the lowest evaluation step count. PPO is the closest competitor, but it pools slightly less consistently and uses more steps. Q-learning and SARSA solve the task but lag on timeliness.
+The central empirical result changes the paper's interpretation. DQN is the \emph{best learned policy}: it has the highest on-time rider rate among the RL methods, the fewest late dropoffs, and the lowest evaluation step count. PPO is the closest learned competitor, while Q-learning and SARSA lag on timeliness. However, the strongest overall method is not RL at all. The nearest-stop heuristic outperforms every learned policy by a large margin.
 
-This pattern matches the intuition behind our formulation. Once the problem includes multiple riders, deadlines, and phase-aware traffic, tabular state-action storage becomes less efficient. The symbolic state representation still expands quickly, and Q-learning/SARSA cannot generalize across nearby rider configurations. DQN can. PPO also generalizes, but in this benchmark it appears somewhat more sample-hungry than DQN.
+That finding is informative rather than disappointing. It suggests that the current benchmark still rewards local geometric structure very strongly. Because the environment executes shortest-path travel automatically and demand is spatially clustered, a heuristic that repeatedly chooses the nearest legal stop already captures much of the useful structure. In contrast, earliest-deadline-first performs worse than nearest-stop and does not pool riders, which shows that not all simple heuristics are equally good. The benchmark therefore does reveal meaningful tradeoffs, but it also shows that RL is not yet necessary to achieve strong performance.
 
-The results also justify our design decision to evaluate more than task completion. If we reported only success rate, the methods would appear equivalent. The on-time rider rate and late-dropoff statistics reveal the actual quality gap.
+The revised conclusion is more modest and more credible: our benchmark is useful because it distinguishes between learned methods, but also because it reveals when a compact rideshare problem is still dominated by simple local rules. If we had reported only RL-vs-RL comparisons, we would have missed that much stronger conclusion.
+
+\subsection{Ablation Study}
+We also ran a focused DQN ablation to test two engineering choices that might otherwise be overcredited: curriculum learning and action masking. In a separate three-seed run, the full DQN model reached 66.3\% on-time riders with 1.35 late dropoffs and 41.5 mean steps. Removing action masking changed little: 67.9\% on-time riders, 1.28 late dropoffs, and 41.6 steps. Surprisingly, removing curriculum improved the result to 75.0\% on-time riders, 1.00 late dropoffs, and 39.0 steps.
+
+This is a negative result, but an important one. It suggests that on the current benchmark, neither curriculum learning nor masking is the main reason DQN works. Instead, the dominant factor appears to be the map geometry and clustered demand itself. That makes the benchmark more interpretable, but it also means we should avoid claiming that our training scaffolding is a key algorithmic contribution.
 
 \subsection{Qualitative Behavior}
-The qualitative comparison in Figure~\ref{fig:map-showdown} reinforces the numerical results. DQN typically commits to more direct stop orderings once a phase-aware pattern has been recognized. PPO often finds similar routes but is somewhat less consistent about pooling two riders early in the episode. The tabular baselines can still solve the route set, but they more often choose service orders that create one or two extra detours, which then show up as higher step counts and more late riders.
+The qualitative comparison in Figure~\ref{fig:map-showdown} still helps explain the learned-method ranking. DQN typically commits to more direct stop orderings once a phase-aware pattern has been recognized. PPO often finds similar routes but is somewhat less consistent about pooling two riders early in the episode. The tabular baselines can still solve the route set, but they more often choose service orders that create one or two extra detours, which then show up as higher step counts and more late riders.
 
-This matters because the benchmark was designed to make such differences visible. Since the environment handles shortest-path travel automatically, any route inefficiency in the final visualization comes from the \emph{choice of next stop}, not from low-level navigation error. That is exactly the behavior we wanted to compare.
+Since the environment handles shortest-path travel automatically, any route inefficiency in the visualization comes from the \emph{choice of next stop}, not from low-level navigation error. That is exactly the behavior we wanted to compare. At the same time, the strong nearest-stop heuristic implies that many good choices are still recoverable from simple local geometry, which helps explain why the benchmark does not yet strongly favor learned policies over handcrafted ones.
 
 \subsection{Threats to Validity}
 Our conclusions should be interpreted with a few limitations in mind. First, the benchmark uses a single vehicle and fixed rider batch per episode, so it is closer to compact pooled dispatch than to full marketplace simulation. Second, traffic is represented as additive road-cell penalties rather than dynamic travel-time uncertainty. Third, the present evaluation uses three seeds and moderate training budgets, which is enough to expose stable trends but not enough to claim fully tuned state-of-the-art performance.
 
 \section{Conclusion}
-We developed a phase-aware, action-masked pooled rideshare dispatch benchmark on a real OpenStreetMap extract of downtown London, Ontario. The key idea was to let the environment handle shortest-path routing while RL learns the next-stop dispatch policy. This makes the problem realistic enough to be interesting, but small enough to remain interpretable.
+We developed a phase-aware pooled rideshare dispatch benchmark on a real OpenStreetMap extract of downtown London, Ontario. The key idea was to let the environment handle shortest-path routing while learned or handcrafted policies solve the next-stop dispatch problem. This makes the problem realistic enough to be interesting, but still compact enough to inspect.
 
-Our technique effectively tackles the problem in the sense that all methods learned viable policies and the benchmark exposes meaningful differences in service quality. Among the compared approaches, DQN performed best, indicating that neural value approximation is better suited than tabular baselines for this structured multi-rider setting.
+Our strongest conclusion is not that RL solves the problem best. Instead, the benchmark reveals two things at once: DQN is the best \emph{learned} policy among the compared RL methods, but a simple nearest-stop heuristic is stronger overall. The ablation study further shows that curriculum learning and action masking are not the main source of DQN's performance on this environment. Together, these findings make the paper more useful: the benchmark exposes when learned dispatch helps, when heuristics are still hard to beat, and which engineering choices matter less than expected.
 
-Several limitations remain. The benchmark is single-vehicle, the traffic phase is fixed within an episode, and deadlines are deterministic. Future research should extend the environment to multi-vehicle coordination, online rider arrivals, stochastic congestion, fairness constraints, and richer hybrid approaches that combine offline demand models with online RL dispatch. A particularly promising direction is to compare learned dispatch against explicit assignment heuristics on exactly the same London benchmark, which would connect this compact academic environment back to the broader ride-sharing optimization literature.
+Several limitations remain. The benchmark is single-vehicle, the traffic phase is fixed within an episode, and deadlines are deterministic. Future research should therefore make the environment less favorable to local geometric rules by introducing online rider arrivals, within-episode traffic changes, multi-vehicle coordination, asymmetric rider priorities, and larger batch sizes. Those extensions would create a stronger test of whether learned dispatch truly outperforms well-designed heuristics.
 
 \bibliographystyle{plainnat}
 \bibliography{references}

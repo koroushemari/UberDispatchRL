@@ -763,7 +763,10 @@ class LondonUberDispatchEnv:
         return lookup
 
     def road_distance(self, a: tuple[int, int], b: tuple[int, int]) -> int:
-        return int(self.distance_cache[a][b])
+        if a in self.distance_cache:
+            return int(self.distance_cache[a][b])
+        distance_map, _ = self._bfs(a)
+        return int(distance_map[b])
 
     def _build_phase_traffic_maps(self) -> list[dict[tuple[int, int], float]]:
         phase_maps = []
@@ -824,6 +827,11 @@ class LondonUberDispatchEnv:
 
     def carrying_count(self) -> int:
         return sum(request.status == 1 for request in self.requests)
+
+    def _position_anchor(self, position: tuple[int, int]) -> tuple[int, int]:
+        if position in self.mobility_index:
+            return position
+        return min(self.mobility_nodes, key=lambda node: self.road_distance(position, node))
 
     def delivered_count(self) -> int:
         return sum(request.status == 2 and not request.is_placeholder for request in self.requests)
@@ -945,7 +953,7 @@ class LondonUberDispatchEnv:
         return mask
 
     def state_key(self):
-        position = tuple(self.driver_position)
+        position = self._position_anchor(tuple(self.driver_position))
         request_signature = tuple(
             (
                 request.pickup_hub,
@@ -961,7 +969,8 @@ class LondonUberDispatchEnv:
     def observation(self) -> np.ndarray:
         obs = np.zeros(self.obs_dim, dtype=np.float32)
         cursor = 0
-        position = tuple(self.driver_position)
+        raw_position = tuple(self.driver_position)
+        position = self._position_anchor(raw_position)
         obs[cursor + self.mobility_index[position]] = 1.0
         cursor += len(self.mobility_nodes)
         obs[cursor + self.carrying_count()] = 1.0
@@ -988,15 +997,15 @@ class LondonUberDispatchEnv:
             obs[cursor + self._wait_bucket(request.wait_steps)] = 1.0
             cursor += self.wait_buckets
             current_target = self.hubs[request.pickup_hub] if request.status == 0 else self.hubs[request.dropoff_hub]
-            obs[cursor] = min(1.0, self.road_distance(position, current_target) / max(1.0, float(self.max_trip))) if request.status != 2 else 0.0
+            obs[cursor] = min(1.0, self.road_distance(raw_position, current_target) / max(1.0, float(self.max_trip))) if request.status != 2 else 0.0
             obs[cursor + 1] = request.deadline_remaining / max(1.0, float(self.max_deadline))
             obs[cursor + 2] = request.wait_steps / max(1.0, float(self.max_steps))
             obs[cursor + 3] = request.ride_steps / max(1.0, float(self.max_steps))
             obs[cursor + 4] = 1.0 if request.was_late else 0.0
             cursor += 5
 
-        obs[cursor] = position[0] / max(1.0, float(self.width - 1))
-        obs[cursor + 1] = position[1] / max(1.0, float(self.height - 1))
+        obs[cursor] = raw_position[0] / max(1.0, float(self.width - 1))
+        obs[cursor + 1] = raw_position[1] / max(1.0, float(self.height - 1))
         obs[cursor + 2] = self.delivered_count() / max(1.0, float(self.current_request_count))
         obs[cursor + 3] = self.late_dropoff_count() / max(1.0, float(self.current_request_count))
         obs[cursor + 4] = self.peak_occupancy / max(1.0, float(self.capacity))
@@ -1120,6 +1129,7 @@ class LondonUberDispatchEnv:
 
 
 ALGORITHMS = ("q_learning", "sarsa", "dqn", "ppo")
+HEURISTICS = ("nearest_stop", "earliest_deadline")
 DEFAULT_AGENT_CONFIGS = {
     "q_learning": {"learning_rate": 0.18, "discount": 0.99, "epsilon_decay_steps": 14000},
     "sarsa": {"learning_rate": 0.14, "discount": 0.985, "epsilon_decay_steps": 12000},
@@ -1143,6 +1153,37 @@ DEFAULT_AGENT_CONFIGS = {
         "minibatch_size": 96,
     },
 }
+
+
+def _target_distance(env: LondonUberDispatchEnv, info: dict, action: int) -> int:
+    _, target = env._action_target(action)
+    return env.road_distance(tuple(info["driver_position"]), target)
+
+
+def heuristic_action(policy_name: str, env: LondonUberDispatchEnv, info: dict) -> int:
+    valid_actions = np.flatnonzero(np.asarray(info["valid_actions"], dtype=bool))
+    if len(valid_actions) == 0:
+        return 0
+
+    if policy_name == "nearest_stop":
+        ranked = sorted(valid_actions, key=lambda action: (_target_distance(env, info, int(action)), int(action)))
+        return int(ranked[0])
+
+    if policy_name == "earliest_deadline":
+        def rank(action: int) -> tuple[float, float, int]:
+            request_index = int(action) % env.n_active_requests
+            request = info["requests"][request_index]
+            dropoff_bias = 0 if int(action) >= env.n_active_requests else 1
+            return (
+                request["deadline_remaining"],
+                dropoff_bias,
+                _target_distance(env, info, int(action)),
+            )
+
+        ranked = sorted(valid_actions, key=rank)
+        return int(ranked[0])
+
+    raise ValueError(f"Unknown heuristic policy: {policy_name}")
 
 
 def make_agent(name: str, env: LondonUberDispatchEnv, seed: int, config: dict | None = None):
@@ -1204,23 +1245,32 @@ def greedy_action(agent, obs: np.ndarray, state_key, valid_actions) -> int:
     raise TypeError(f"Unsupported agent type: {type(agent)!r}")
 
 
-def train_agent(algorithm_name: str, episodes: int, seed: int, config: dict | None = None, layout_path: str | Path | None = None) -> dict:
+def train_agent(
+    algorithm_name: str,
+    episodes: int,
+    seed: int,
+    config: dict | None = None,
+    layout_path: str | Path | None = None,
+    *,
+    use_curriculum: bool = True,
+    use_action_mask: bool = True,
+) -> dict:
     env = LondonUberDispatchEnv(seed=seed, layout_path=layout_path)
     agent = make_agent(algorithm_name, env, seed, config=config)
     rewards, delivered, pooled, late = [], [], [], []
 
     for episode in range(1, episodes + 1):
         progress = episode / float(max(1, episodes))
-        if progress < 0.25:
+        if use_curriculum and progress < 0.25:
             request_count, phase_count, slack_bonus = 2, 1, 18
-        elif progress < 0.6:
+        elif use_curriculum and progress < 0.6:
             request_count, phase_count, slack_bonus = env.n_active_requests, 2, 14
         else:
             request_count, phase_count, slack_bonus = env.n_active_requests, env.n_phases, 10
 
         obs, info = env.reset(request_count=request_count, phase_count=phase_count, deadline_slack_bonus=slack_bonus)
         state_key = info["state_key"]
-        valid_actions = info["valid_actions"]
+        valid_actions = info["valid_actions"] if use_action_mask else None
         episode_reward = 0.0
         done = False
 
@@ -1234,20 +1284,20 @@ def train_agent(algorithm_name: str, episodes: int, seed: int, config: dict | No
                 action = agent.act(state_key, training=True, valid_actions=valid_actions)
                 next_obs, reward, done, next_info = env.step(action)
                 next_state_key = next_info["state_key"]
-                next_valid_actions = next_info["valid_actions"]
+                next_valid_actions = next_info["valid_actions"] if use_action_mask else None
                 agent.update(state_key, action, reward, next_state_key, done, next_valid_actions=next_valid_actions)
                 obs, state_key, valid_actions = next_obs, next_state_key, next_valid_actions
             elif isinstance(agent, SparseSARSAAgent):
                 next_obs, reward, done, next_info = env.step(action)
                 next_state_key = next_info["state_key"]
-                next_valid_actions = next_info["valid_actions"]
+                next_valid_actions = next_info["valid_actions"] if use_action_mask else None
                 next_action = 0 if done else agent.act(next_state_key, training=True, valid_actions=next_valid_actions)
                 agent.update(state_key, action, reward, next_state_key, next_action, done)
                 obs, state_key, action, valid_actions = next_obs, next_state_key, next_action, next_valid_actions
             elif isinstance(agent, DQNAgent):
                 action = agent.act(obs, training=True, valid_actions=valid_actions)
                 next_obs, reward, done, next_info = env.step(action)
-                next_valid_actions = next_info["valid_actions"]
+                next_valid_actions = next_info["valid_actions"] if use_action_mask else None
                 agent.store(obs, action, reward, next_obs, done, next_action_mask=next_valid_actions)
                 agent.update()
                 obs, state_key, valid_actions = next_obs, next_info["state_key"], next_valid_actions
@@ -1260,8 +1310,8 @@ def train_agent(algorithm_name: str, episodes: int, seed: int, config: dict | No
                 ep_log_probs.append(log_prob)
                 ep_values.append(value)
                 ep_dones.append(done)
-                ep_masks.append(np.asarray(valid_actions, dtype=bool))
-                obs, state_key, valid_actions = next_obs, next_info["state_key"], next_info["valid_actions"]
+                ep_masks.append(np.asarray(_action_mask(valid_actions, env.n_actions), dtype=bool))
+                obs, state_key, valid_actions = next_obs, next_info["state_key"], (next_info["valid_actions"] if use_action_mask else None)
             else:
                 raise TypeError(f"Unsupported agent type: {type(agent)!r}")
             episode_reward += reward
@@ -1286,10 +1336,34 @@ def train_agent(algorithm_name: str, episodes: int, seed: int, config: dict | No
         "training_pooled": np.array(pooled, dtype=np.float32),
         "training_late": np.array(late, dtype=np.float32),
         "config": config or DEFAULT_AGENT_CONFIGS[algorithm_name],
+        "use_curriculum": use_curriculum,
+        "use_action_mask": use_action_mask,
     }
 
 
-def evaluate_agent(agent, eval_episodes: int, seed: int, layout_path: str | Path | None = None) -> dict:
+def _summarize_episode_metrics(
+    rewards: list[float],
+    successes: list[float],
+    steps: list[float],
+    deliveries: list[float],
+    pooled: list[float],
+    late_dropoffs: list[float],
+    peak_occupancy: list[float],
+    on_time_rates: list[float],
+) -> dict:
+    return {
+        "mean_reward": float(np.mean(rewards)),
+        "success_rate": float(np.mean(successes)),
+        "mean_steps": float(np.mean(steps)),
+        "mean_deliveries": float(np.mean(deliveries)),
+        "pooled_rate": float(np.mean(pooled)),
+        "mean_late_dropoffs": float(np.mean(late_dropoffs)),
+        "mean_peak_occupancy": float(np.mean(peak_occupancy)),
+        "on_time_rate": float(np.mean(on_time_rates)),
+    }
+
+
+def evaluate_agent(agent, eval_episodes: int, seed: int, layout_path: str | Path | None = None, *, use_action_mask: bool = True) -> dict:
     env = LondonUberDispatchEnv(seed=seed, layout_path=layout_path)
     rewards, successes, steps, deliveries, pooled = [], [], [], [], []
     late_dropoffs, peak_occupancy, on_time_rates = [], [], []
@@ -1297,14 +1371,14 @@ def evaluate_agent(agent, eval_episodes: int, seed: int, layout_path: str | Path
     for episode in range(eval_episodes):
         obs, info = env.reset(seed=seed * 1000 + episode, request_count=env.n_active_requests, phase_count=env.n_phases, deadline_slack_bonus=10)
         state_key = info["state_key"]
-        valid_actions = info["valid_actions"]
+        valid_actions = info["valid_actions"] if use_action_mask else None
         done = False
         episode_reward = 0.0
         while not done:
             action = greedy_action(agent, obs, state_key, valid_actions)
             obs, reward, done, info = env.step(action)
             state_key = info["state_key"]
-            valid_actions = info["valid_actions"]
+            valid_actions = info["valid_actions"] if use_action_mask else None
             episode_reward += reward
         rewards.append(episode_reward)
         successes.append(1.0 if env.success else 0.0)
@@ -1316,16 +1390,33 @@ def evaluate_agent(agent, eval_episodes: int, seed: int, layout_path: str | Path
         on_time = 0.0 if info["delivered_count"] == 0 else max(0.0, (info["delivered_count"] - info["late_dropoffs"]) / float(info["delivered_count"]))
         on_time_rates.append(on_time)
 
-    return {
-        "mean_reward": float(np.mean(rewards)),
-        "success_rate": float(np.mean(successes)),
-        "mean_steps": float(np.mean(steps)),
-        "mean_deliveries": float(np.mean(deliveries)),
-        "pooled_rate": float(np.mean(pooled)),
-        "mean_late_dropoffs": float(np.mean(late_dropoffs)),
-        "mean_peak_occupancy": float(np.mean(peak_occupancy)),
-        "on_time_rate": float(np.mean(on_time_rates)),
-    }
+    return _summarize_episode_metrics(rewards, successes, steps, deliveries, pooled, late_dropoffs, peak_occupancy, on_time_rates)
+
+
+def evaluate_heuristic(policy_name: str, eval_episodes: int, seed: int, layout_path: str | Path | None = None) -> dict:
+    env = LondonUberDispatchEnv(seed=seed, layout_path=layout_path)
+    rewards, successes, steps, deliveries, pooled = [], [], [], [], []
+    late_dropoffs, peak_occupancy, on_time_rates = [], [], []
+
+    for episode in range(eval_episodes):
+        _, info = env.reset(seed=seed * 1000 + episode, request_count=env.n_active_requests, phase_count=env.n_phases, deadline_slack_bonus=10)
+        done = False
+        episode_reward = 0.0
+        while not done:
+            action = heuristic_action(policy_name, env, info)
+            _, reward, done, info = env.step(action)
+            episode_reward += reward
+        rewards.append(episode_reward)
+        successes.append(1.0 if env.success else 0.0)
+        steps.append(info["steps"])
+        deliveries.append(info["delivered_count"])
+        pooled.append(1.0 if env.peak_occupancy >= 2 else 0.0)
+        late_dropoffs.append(info["late_dropoffs"])
+        peak_occupancy.append(info["peak_occupancy"])
+        on_time = 0.0 if info["delivered_count"] == 0 else max(0.0, (info["delivered_count"] - info["late_dropoffs"]) / float(info["delivered_count"]))
+        on_time_rates.append(on_time)
+
+    return _summarize_episode_metrics(rewards, successes, steps, deliveries, pooled, late_dropoffs, peak_occupancy, on_time_rates)
 
 
 def rolling_mean(values: np.ndarray, window: int = 120) -> np.ndarray:
@@ -1346,19 +1437,65 @@ def aggregate_results(run_results: dict[str, list[dict]], eval_episodes: int, la
         pooled_curves = np.stack([run["training_pooled"] for run in seed_runs], axis=0)
         eval_metrics = []
         for seed_index, run in enumerate(seed_runs):
-            eval_metrics.append(evaluate_agent(run["agent"], eval_episodes=eval_episodes, seed=7400 + seed_index, layout_path=layout_path))
+            eval_metrics.append(
+                evaluate_agent(
+                    run["agent"],
+                    eval_episodes=eval_episodes,
+                    seed=7400 + seed_index,
+                    layout_path=layout_path,
+                    use_action_mask=run.get("use_action_mask", True),
+                )
+            )
         aggregated[algorithm_name] = {
             "seed_runs": seed_runs,
             "mean_training_rewards": reward_curves.mean(axis=0),
             "mean_training_delivered": delivered_curves.mean(axis=0),
             "mean_training_pooled": pooled_curves.mean(axis=0),
             "evaluation": {key: float(np.mean([metric[key] for metric in eval_metrics])) for key in eval_metrics[0]},
+            "evaluation_std": {key: float(np.std([metric[key] for metric in eval_metrics])) for key in eval_metrics[0]},
             "config": seed_runs[0]["config"],
         }
     return aggregated
 
 
-def plot_results(results: dict, output_dir: Path) -> None:
+def evaluate_heuristics(eval_episodes: int, seeds: int, layout_path: str | Path | None = None) -> dict:
+    results = {}
+    for policy_name in HEURISTICS:
+        per_seed = [evaluate_heuristic(policy_name, eval_episodes=eval_episodes, seed=9100 + seed, layout_path=layout_path) for seed in range(seeds)]
+        results[policy_name] = {
+            "evaluation": {key: float(np.mean([metric[key] for metric in per_seed])) for key in per_seed[0]},
+            "evaluation_std": {key: float(np.std([metric[key] for metric in per_seed])) for key in per_seed[0]},
+        }
+    return results
+
+
+def run_dqn_ablations(episodes: int, seeds: int, eval_episodes: int, layout_path: str | Path | None = None) -> dict:
+    variants = {
+        "dqn_full": {"use_curriculum": True, "use_action_mask": True},
+        "dqn_no_curriculum": {"use_curriculum": False, "use_action_mask": True},
+        "dqn_no_mask": {"use_curriculum": True, "use_action_mask": False},
+    }
+    results = {}
+    for variant_name, variant in variants.items():
+        seed_runs = []
+        for seed in range(seeds):
+            seed_runs.append(
+                train_agent(
+                    "dqn",
+                    episodes=episodes,
+                    seed=100 + seed,
+                    config=DEFAULT_AGENT_CONFIGS["dqn"],
+                    layout_path=layout_path,
+                    use_curriculum=variant["use_curriculum"],
+                    use_action_mask=variant["use_action_mask"],
+                )
+            )
+        aggregated = aggregate_results({variant_name: seed_runs}, eval_episodes=eval_episodes, layout_path=layout_path)[variant_name]
+        results[variant_name] = aggregated
+    return results
+
+
+def plot_results(results: dict, output_dir: Path, heuristic_results: dict | None = None) -> None:
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
     axes = axes.ravel()
     for algorithm_name, result in results.items():
@@ -1369,11 +1506,14 @@ def plot_results(results: dict, output_dir: Path) -> None:
     axes[0].set_title("Rolling Training Reward"); axes[0].set_xlabel("Episode"); axes[0].set_ylabel("Reward"); axes[0].grid(alpha=0.3); axes[0].legend()
     axes[1].set_title("Rolling Riders Delivered"); axes[1].set_xlabel("Episode"); axes[1].set_ylabel("Delivered Riders"); axes[1].grid(alpha=0.3)
     axes[2].set_title("Rolling Pooling Rate"); axes[2].set_xlabel("Episode"); axes[2].set_ylabel("Episodes using 2 riders"); axes[2].grid(alpha=0.3)
-    labels = [name.replace("_", " ").title() for name in results]
+    comparison = {**results}
+    if heuristic_results:
+        comparison.update(heuristic_results)
+    labels = [name.replace("_", " ").title() for name in comparison]
     x = np.arange(len(labels))
-    on_time = [results[name]["evaluation"]["on_time_rate"] * 100.0 for name in results]
-    deliveries = [results[name]["evaluation"]["mean_deliveries"] for name in results]
-    pooling = [results[name]["evaluation"]["pooled_rate"] * 100.0 for name in results]
+    on_time = [comparison[name]["evaluation"]["on_time_rate"] * 100.0 for name in comparison]
+    deliveries = [comparison[name]["evaluation"]["mean_deliveries"] for name in comparison]
+    pooling = [comparison[name]["evaluation"]["pooled_rate"] * 100.0 for name in comparison]
     width = 0.26
     axes[3].bar(x - width, on_time, width=width, label="On-Time Riders (%)", color="#2563eb")
     axes[3].bar(x, deliveries, width=width, label="Mean Riders", color="#f59e0b")
@@ -1382,13 +1522,14 @@ def plot_results(results: dict, output_dir: Path) -> None:
     fig.tight_layout(); fig.savefig(output_dir / "results_summary.png", dpi=180); plt.close(fig)
 
 
-def save_summary(results: dict, output_dir: Path, city_name: str) -> None:
+def save_summary(results: dict, output_dir: Path, city_name: str, heuristic_results: dict | None = None, ablation_results: dict | None = None) -> None:
     payload = {}
     lines = [f"{city_name} Uber dispatch RL comparison", "=" * (len(city_name) + 34), ""]
     for algorithm_name, result in results.items():
         evaluation = result["evaluation"]
         payload[algorithm_name] = {
             "evaluation": evaluation,
+            "evaluation_std": result.get("evaluation_std", {}),
             "mean_training_reward": float(np.mean(result["mean_training_rewards"])),
             "mean_training_delivered": float(np.mean(result["mean_training_delivered"])),
             "mean_training_pooled": float(np.mean(result["mean_training_pooled"])),
@@ -1406,6 +1547,40 @@ def save_summary(results: dict, output_dir: Path, city_name: str) -> None:
             f"  mean evaluation steps: {evaluation['mean_steps']:.2f}",
             "",
         ])
+    if heuristic_results:
+        lines.extend(["Heuristic baselines", "-------------------", ""])
+        payload["heuristics"] = {}
+        for name, result in heuristic_results.items():
+            evaluation = result["evaluation"]
+            payload["heuristics"][name] = result
+            lines.extend([
+                name.replace("_", " ").title(),
+                f"  mean evaluation reward: {evaluation['mean_reward']:.2f}",
+                f"  full success rate: {evaluation['success_rate'] * 100.0:.1f}%",
+                f"  on-time rider rate: {evaluation['on_time_rate'] * 100.0:.1f}%",
+                f"  mean late dropoffs: {evaluation['mean_late_dropoffs']:.2f}",
+                f"  pooling rate: {evaluation['pooled_rate'] * 100.0:.1f}%",
+                f"  mean evaluation steps: {evaluation['mean_steps']:.2f}",
+                "",
+            ])
+    if ablation_results:
+        lines.extend(["DQN ablations", "-------------", ""])
+        payload["ablations"] = {}
+        for name, result in ablation_results.items():
+            evaluation = result["evaluation"]
+            payload["ablations"][name] = {
+                "evaluation": evaluation,
+                "evaluation_std": result.get("evaluation_std", {}),
+                "config": result["config"],
+            }
+            lines.extend([
+                name.replace("_", " ").title(),
+                f"  on-time rider rate: {evaluation['on_time_rate'] * 100.0:.1f}%",
+                f"  mean late dropoffs: {evaluation['mean_late_dropoffs']:.2f}",
+                f"  pooling rate: {evaluation['pooled_rate'] * 100.0:.1f}%",
+                f"  mean evaluation steps: {evaluation['mean_steps']:.2f}",
+                "",
+            ])
     (output_dir / "summary.txt").write_text("\n".join(lines))
     (output_dir / "summary.json").write_text(json.dumps(payload, indent=2))
 
@@ -1417,6 +1592,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-episodes", type=int, default=20)
     parser.add_argument("--output-dir", default="final_results")
     parser.add_argument("--layout-path", default=str(DEFAULT_LAYOUT_PATH))
+    parser.add_argument("--include-heuristics", action="store_true")
+    parser.add_argument("--run-ablations", action="store_true")
+    parser.add_argument("--ablation-episodes", type=int, default=700)
     return parser.parse_args()
 
 
@@ -1430,8 +1608,10 @@ def main() -> None:
         for seed in range(args.seeds):
             run_results[algorithm_name].append(train_agent(algorithm_name, args.episodes, seed, config=DEFAULT_AGENT_CONFIGS[algorithm_name], layout_path=args.layout_path))
     aggregated = aggregate_results(run_results, eval_episodes=args.eval_episodes, layout_path=args.layout_path)
-    plot_results(aggregated, output_dir)
-    save_summary(aggregated, output_dir, city_name=sample_env.city_name)
+    heuristic_results = evaluate_heuristics(args.eval_episodes, args.seeds, layout_path=args.layout_path) if args.include_heuristics else None
+    ablation_results = run_dqn_ablations(args.ablation_episodes, args.seeds, args.eval_episodes, layout_path=args.layout_path) if args.run_ablations else None
+    plot_results(aggregated, output_dir, heuristic_results=heuristic_results)
+    save_summary(aggregated, output_dir, city_name=sample_env.city_name, heuristic_results=heuristic_results, ablation_results=ablation_results)
     print(f"Saved outputs to {output_dir.resolve()}")
 
 
