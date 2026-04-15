@@ -1,0 +1,42 @@
+Downtown London, Ontario Uber dispatch RL comparison
+==========================================================
+
+Q Learning
+  mean evaluation reward: 139.39
+  full success rate: 100.0%
+  on-time rider rate: 53.3%
+  mean riders delivered: 4.00
+  mean late dropoffs: 1.87
+  pooling rate: 100.0%
+  mean peak occupancy: 2.00
+  mean evaluation steps: 45.55
+
+Sarsa
+  mean evaluation reward: 138.54
+  full success rate: 100.0%
+  on-time rider rate: 52.1%
+  mean riders delivered: 4.00
+  mean late dropoffs: 1.92
+  pooling rate: 100.0%
+  mean peak occupancy: 2.00
+  mean evaluation steps: 45.78
+
+Dqn
+  mean evaluation reward: 141.12
+  full success rate: 100.0%
+  on-time rider rate: 58.3%
+  mean riders delivered: 4.00
+  mean late dropoffs: 1.67
+  pooling rate: 98.3%
+  mean peak occupancy: 1.98
+  mean evaluation steps: 43.43
+
+Ppo
+  mean evaluation reward: 136.43
+  full success rate: 100.0%
+  on-time rider rate: 56.7%
+  mean riders delivered: 4.00
+  mean late dropoffs: 1.73
+  pooling rate: 93.3%
+  mean peak occupancy: 1.93
+  mean evaluation steps: 45.43
