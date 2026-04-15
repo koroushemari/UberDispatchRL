@@ -1,20 +1,18 @@
 # UberDispatchRL
 
-Open [UberDispatchRL.ipynb](UberDispatchRL.ipynb) first.
+Open [UberDispatchRL.ipynb](UberDispatchRL.ipynb) first and run the notebook from top to bottom.
 
-This repo is intentionally minimal:
+This repo is intentionally minimal and course-project style:
 
 - `UberDispatchRL.ipynb`: the full story-driven notebook version of the project
 - `london_uber_layout.json`: the processed downtown London map used by the notebook
 
 The notebook contains:
 
-- the RL agents
-- the London dispatch environment
-- heuristic baselines
-- training and evaluation helpers
-- the DQN ablation logic
-- commented cells that reproduce the final experiments
+- separate code cells for utilities, agents, environment, heuristics, and experiments
+- comments at the top of each code cell
+- a few cells with displayed sample results already shown
+- commented cells for the longer full experiment and ablation runs
 
 Main conclusion from the project:
 
